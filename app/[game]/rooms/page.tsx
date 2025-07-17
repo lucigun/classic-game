@@ -1,7 +1,7 @@
 "use client"
 
 import type { FormEvent } from "react"
-import { useState, useEffect } from "react"
+import { useState, useEffect, useRef } from "react" // useRef 추가
 import { useParams, useRouter } from "next/navigation"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
@@ -36,11 +36,12 @@ export default function GameRoomsPage() {
   const [roomTitle, setRoomTitle] = useState("")
   const [nickname, setNickname] = useState("")
   const [isCreating, setIsCreating] = useState(false)
+  const [isConnected, setIsConnected] = useState(false) // 연결 상태 추가
 
   const gameName = gameNames[game] || game
 
   // Socket.IO 클라이언트 인스턴스를 저장할 ref
-  const socketRef = useState<Socket | null>(null)
+  const socketRef = useRef<Socket | null>(null)
 
   // WebSocket 연결 및 이벤트 리스너 설정
   useEffect(() => {
@@ -48,35 +49,60 @@ export default function GameRoomsPage() {
     // Vercel에 배포할 때 이 환경 변수를 설정해야 합니다.
     const SOCKET_SERVER_URL = process.env.NEXT_PUBLIC_SOCKET_SERVER_URL || "http://localhost:3001"
 
+    // 이미 연결된 소켓이 있다면 재사용하지 않음
+    if (socketRef.current && socketRef.current.connected) {
+      setIsConnected(true)
+      socketRef.current.emit("getRooms") // 연결되어 있다면 초기 룸 목록 요청
+      return
+    }
+
     // Socket.IO 서버에 연결합니다.
     const socket: Socket = io(SOCKET_SERVER_URL, {
       transports: ["websocket", "polling"], // 웹소켓 연결 실패 시 폴링으로 전환
+      reconnectionAttempts: 5, // 재연결 시도 횟수
+      reconnectionDelay: 1000, // 재연결 시도 간격 (1초)
     })
 
     socketRef.current = socket // ref에 소켓 인스턴스 저장
 
     socket.on("connect", () => {
-      console.log("WebSocket connected to server:", SOCKET_SERVER_URL)
+      console.log("✅ WebSocket connected to server:", SOCKET_SERVER_URL)
+      setIsConnected(true)
       socket.emit("getRooms") // 연결 시 초기 룸 목록 요청
     })
 
-    socket.on("disconnect", () => {
-      console.log("WebSocket disconnected from server.")
+    socket.on("disconnect", (reason) => {
+      console.log("❌ WebSocket disconnected from server. Reason:", reason)
+      setIsConnected(false)
     })
 
     socket.on("roomsUpdate", (updatedRooms: Room[]) => {
-      console.log("Rooms updated from server:", updatedRooms)
+      console.log("🔄 Rooms updated from server:", updatedRooms)
       setRooms(updatedRooms)
     })
 
     socket.on("connect_error", (err) => {
-      console.error("Socket.IO connection error:", err.message)
+      console.error("🚨 Socket.IO connection error:", err.message)
+      setIsConnected(false)
       // 연결 실패 시 사용자에게 알림 등을 표시할 수 있습니다.
+    })
+
+    socket.on("reconnect_attempt", (attemptNumber) => {
+      console.log(`Attempting to reconnect... (${attemptNumber})`)
+    })
+
+    socket.on("reconnect_error", (err) => {
+      console.error("Reconnection error:", err.message)
+    })
+
+    socket.on("reconnect_failed", () => {
+      console.error("Reconnection failed permanently.")
     })
 
     // 클린업 함수 (컴포넌트 언마운트 시 연결 해제)
     return () => {
       if (socketRef.current) {
+        console.log("🔌 Disconnecting Socket.IO client...")
         socketRef.current.disconnect()
         socketRef.current = null
       }
@@ -86,6 +112,12 @@ export default function GameRoomsPage() {
   const handleCreateRoom = async (e: FormEvent<HTMLFormElement>) => {
     e.preventDefault()
     if (!roomTitle.trim() || !nickname.trim()) return
+
+    if (!isConnected) {
+      alert("서버에 연결되지 않았습니다. 잠시 후 다시 시도해주세요.")
+      console.warn("Attempted to create room while not connected to Socket.IO server.")
+      return
+    }
 
     setIsCreating(true)
 
@@ -103,6 +135,12 @@ export default function GameRoomsPage() {
   }
 
   const handleJoinRoom = (roomId: string) => {
+    if (!isConnected) {
+      alert("서버에 연결되지 않았습니다. 잠시 후 다시 시도해주세요.")
+      console.warn("Attempted to join room while not connected to Socket.IO server.")
+      return
+    }
+
     if (socketRef.current) {
       // 서버에 룸 참여 요청
       socketRef.current.emit("joinRoom", { roomId })
@@ -163,7 +201,7 @@ export default function GameRoomsPage() {
               </div>
               <Button
                 type="submit"
-                disabled={isCreating || !roomTitle.trim() || !nickname.trim()}
+                disabled={isCreating || !roomTitle.trim() || !nickname.trim() || !isConnected} // 연결 상태에 따라 버튼 비활성화
                 className="w-full md:w-auto bg-green-600 hover:bg-green-700 text-white font-semibold py-3 px-8"
               >
                 {isCreating ? "방 생성 중..." : "방 만들기"}
@@ -180,8 +218,10 @@ export default function GameRoomsPage() {
               참여 가능한 방 ({rooms.filter((room) => room.players < room.maxPlayers).length}개)
             </h2>
             <div className="flex items-center gap-2 text-sm text-gray-500">
-              <div className="w-2 h-2 bg-green-400 rounded-full animate-pulse"></div>
-              <span>실시간 업데이트</span>
+              <div
+                className={`w-2 h-2 rounded-full ${isConnected ? "bg-green-400 animate-pulse" : "bg-red-400"}`}
+              ></div>
+              <span>{isConnected ? "서버 연결됨" : "서버 연결 끊김"}</span>
             </div>
           </div>
 
@@ -233,9 +273,9 @@ export default function GameRoomsPage() {
 
                       <Button
                         onClick={() => handleJoinRoom(room.id)}
-                        disabled={room.players >= room.maxPlayers}
+                        disabled={room.players >= room.maxPlayers || !isConnected} // 연결 상태에 따라 버튼 비활성화
                         className={`${
-                          room.players >= room.maxPlayers
+                          room.players >= room.maxPlayers || !isConnected
                             ? "bg-gray-400 cursor-not-allowed"
                             : "bg-blue-600 hover:bg-blue-700 group-hover:scale-105"
                         } text-white font-medium px-6 py-2 transition-all duration-300`}
